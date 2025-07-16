@@ -8,11 +8,15 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u105))
 (define-constant ERR-ALREADY-VERIFIED (err u106))
 (define-constant ERR-INVALID-VERIFIER (err u107))
+(define-constant ERR-IDENTITY-INACTIVE (err u108))
+(define-constant ERR-IDENTITY-SUSPENDED (err u109))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant IDENTITY-CREATION-FEE u1000000)
 (define-constant VERIFICATION-FEE u500000)
 (define-constant CERTIFICATE-VALIDITY-BLOCKS u52560)
+(define-constant IDENTITY-INACTIVITY-BLOCKS u157680)
+(define-constant SUSPENSION-COOLDOWN-BLOCKS u2016)
 
 (define-data-var next-identity-id uint u1)
 
@@ -66,6 +70,16 @@
   { added-at: uint, is-active: bool }
 )
 
+(define-map identity-suspensions
+  { identity-id: uint }
+  {
+    suspended-at: uint,
+    suspended-by: principal,
+    reason: (string-ascii 100),
+    can-reactivate-at: uint
+  }
+)
+
 (define-public (create-identity (recovery-address principal))
   (let
     (
@@ -108,6 +122,7 @@
       (current-block stacks-block-height)
     )
     (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-identity-active identity-id) ERR-IDENTITY-INACTIVE)
     
     (map-set identity-data
       { identity-id: identity-id, data-key: data-key }
@@ -272,6 +287,85 @@
   )
 )
 
+(define-public (suspend-identity (identity-id uint) (reason (string-ascii 100)))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+      (reactivation-block (+ current-block SUSPENSION-COOLDOWN-BLOCKS))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (asserts! (is-none (map-get? identity-suspensions { identity-id: identity-id })) ERR-IDENTITY-SUSPENDED)
+    
+    (map-set identity-suspensions
+      { identity-id: identity-id }
+      {
+        suspended-at: current-block,
+        suspended-by: tx-sender,
+        reason: reason,
+        can-reactivate-at: reactivation-block
+      }
+    )
+    
+    (map-set identities
+      { identity-id: identity-id }
+      (merge identity-info {
+        status: "suspended",
+        updated-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (reactivate-identity (identity-id uint))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (suspension-info (unwrap! (map-get? identity-suspensions { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+      (inactivity-threshold (- current-block IDENTITY-INACTIVITY-BLOCKS))
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (>= current-block (get can-reactivate-at suspension-info)) ERR-NOT-AUTHORIZED)
+    
+    (map-delete identity-suspensions { identity-id: identity-id })
+    
+    (map-set identities
+      { identity-id: identity-id }
+      (merge identity-info {
+        status: "active",
+        updated-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (deactivate-inactive-identity (identity-id uint))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+      (inactivity-threshold (- current-block IDENTITY-INACTIVITY-BLOCKS))
+    )
+    (asserts! (< (get updated-at identity-info) inactivity-threshold) ERR-NOT-AUTHORIZED)
+    (asserts! (is-eq (get status identity-info) "active") ERR-IDENTITY-INACTIVE)
+    
+    (map-set identities
+      { identity-id: identity-id }
+      (merge identity-info {
+        status: "inactive",
+        updated-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-read-only (get-identity (identity-id uint))
   (map-get? identities { identity-id: identity-id })
 )
@@ -294,6 +388,26 @@
 
 (define-read-only (get-guardian-info (identity-id uint) (guardian principal))
   (map-get? trusted-guardians { identity-id: identity-id, guardian: guardian })
+)
+
+(define-read-only (get-suspension-info (identity-id uint))
+  (map-get? identity-suspensions { identity-id: identity-id })
+)
+
+(define-read-only (is-identity-active (identity-id uint))
+  (match (map-get? identities { identity-id: identity-id })
+    identity-info
+      (let
+        (
+          (status-check (is-eq (get status identity-info) "active"))
+          (suspension-check (is-none (map-get? identity-suspensions { identity-id: identity-id })))
+          (inactivity-threshold (- stacks-block-height IDENTITY-INACTIVITY-BLOCKS))
+          (activity-check (> (get updated-at identity-info) inactivity-threshold))
+        )
+        (and status-check suspension-check activity-check)
+      )
+    false
+  )
 )
 
 (define-read-only (is-verification-valid (identity-id uint) (verifier principal))
