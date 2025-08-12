@@ -10,6 +10,9 @@
 (define-constant ERR-INVALID-VERIFIER (err u107))
 (define-constant ERR-IDENTITY-INACTIVE (err u108))
 (define-constant ERR-IDENTITY-SUSPENDED (err u109))
+(define-constant ERR-SELF-ENDORSEMENT (err u110))
+(define-constant ERR-ALREADY-ENDORSED (err u111))
+(define-constant ERR-ENDORSEMENT-COOLDOWN (err u112))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant IDENTITY-CREATION-FEE u1000000)
@@ -17,6 +20,7 @@
 (define-constant CERTIFICATE-VALIDITY-BLOCKS u52560)
 (define-constant IDENTITY-INACTIVITY-BLOCKS u157680)
 (define-constant SUSPENSION-COOLDOWN-BLOCKS u2016)
+(define-constant ENDORSEMENT-COOLDOWN-BLOCKS u144)
 
 (define-data-var next-identity-id uint u1)
 
@@ -77,6 +81,30 @@
     suspended-by: principal,
     reason: (string-ascii 100),
     can-reactivate-at: uint
+  }
+)
+
+(define-map identity-endorsements
+  { identity-id: uint, endorser: principal }
+  {
+    endorsed-at: uint,
+    endorsement-type: (string-ascii 50),
+    message: (string-ascii 200)
+  }
+)
+
+(define-map endorsement-history
+  { endorser: principal, target-id: uint }
+  { last-endorsed-at: uint }
+)
+
+(define-map reputation-scores
+  { identity-id: uint }
+  {
+    total-endorsements: uint,
+    positive-score: uint,
+    negative-score: uint,
+    last-calculated-at: uint
   }
 )
 
@@ -432,6 +460,124 @@
     (match (map-get? identities { identity-id: id })
       identity-info (if (is-eq (get owner identity-info) tx-sender) (some id) none)
       none
+    )
+  )
+)
+
+(define-public (endorse-identity (target-id uint) (endorsement-type (string-ascii 50)) (message (string-ascii 200)))
+  (let
+    (
+      (endorser-id-opt (get-identity-by-owner tx-sender))
+      (target-identity (unwrap! (map-get? identities { identity-id: target-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+      (history-key { endorser: tx-sender, target-id: target-id })
+      (last-endorsement (map-get? endorsement-history history-key))
+    )
+    (asserts! (is-some endorser-id-opt) ERR-IDENTITY-NOT-FOUND)
+    (asserts! (not (is-eq (get owner target-identity) tx-sender)) ERR-SELF-ENDORSEMENT)
+    (asserts! (is-identity-active target-id) ERR-IDENTITY-INACTIVE)
+    (asserts! (is-identity-active (unwrap-panic endorser-id-opt)) ERR-IDENTITY-INACTIVE)
+    (asserts! (is-none (map-get? identity-endorsements { identity-id: target-id, endorser: tx-sender })) ERR-ALREADY-ENDORSED)
+    
+    (match last-endorsement
+      history-data
+        (asserts! 
+          (>= (- current-block (get last-endorsed-at history-data)) ENDORSEMENT-COOLDOWN-BLOCKS) 
+          ERR-ENDORSEMENT-COOLDOWN
+        )
+      true
+    )
+    
+    (map-set identity-endorsements
+      { identity-id: target-id, endorser: tx-sender }
+      {
+        endorsed-at: current-block,
+        endorsement-type: endorsement-type,
+        message: message
+      }
+    )
+    
+    (map-set endorsement-history
+      history-key
+      { last-endorsed-at: current-block }
+    )
+    
+    (unwrap-panic (update-reputation-score target-id endorsement-type))
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-endorsement (target-id uint))
+  (let
+    (
+      (endorser-id-opt (get-identity-by-owner tx-sender))
+      (endorsement-key { identity-id: target-id, endorser: tx-sender })
+      (existing-endorsement (unwrap! (map-get? identity-endorsements endorsement-key) ERR-IDENTITY-NOT-FOUND))
+    )
+    (asserts! (is-some endorser-id-opt) ERR-IDENTITY-NOT-FOUND)
+    
+    (map-delete identity-endorsements endorsement-key)
+    
+    (unwrap-panic (update-reputation-score target-id (get endorsement-type existing-endorsement)))
+    
+    (ok true)
+  )
+)
+
+(define-private (update-reputation-score (identity-id uint) (endorsement-type (string-ascii 50)))
+  (let
+    (
+      (current-score (default-to 
+        { total-endorsements: u0, positive-score: u0, negative-score: u0, last-calculated-at: u0 }
+        (map-get? reputation-scores { identity-id: identity-id })
+      ))
+      (score-change (if (is-eq endorsement-type "positive") u10 
+                    (if (is-eq endorsement-type "neutral") u5 u1)))
+      (current-block stacks-block-height)
+    )
+    (map-set reputation-scores
+      { identity-id: identity-id }
+      {
+        total-endorsements: (+ (get total-endorsements current-score) u1),
+        positive-score: (if (is-eq endorsement-type "positive") 
+                         (+ (get positive-score current-score) score-change)
+                         (get positive-score current-score)),
+        negative-score: (if (is-eq endorsement-type "negative") 
+                         (+ (get negative-score current-score) score-change)
+                         (get negative-score current-score)),
+        last-calculated-at: current-block
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-endorsement (identity-id uint) (endorser principal))
+  (map-get? identity-endorsements { identity-id: identity-id, endorser: endorser })
+)
+
+(define-read-only (get-reputation-score (identity-id uint))
+  (default-to 
+    { total-endorsements: u0, positive-score: u0, negative-score: u0, last-calculated-at: u0 }
+    (map-get? reputation-scores { identity-id: identity-id })
+  )
+)
+
+(define-read-only (calculate-trust-score (identity-id uint))
+  (let
+    (
+      (reputation (get-reputation-score identity-id))
+      (total-endorsements (get total-endorsements reputation))
+      (positive-score (get positive-score reputation))
+      (negative-score (get negative-score reputation))
+    )
+    (if (is-eq total-endorsements u0)
+      u0
+      (if (>= positive-score negative-score)
+        (/ (* positive-score u100) (+ positive-score negative-score))
+        (/ (* negative-score u100) (+ positive-score negative-score))
+      )
     )
   )
 )
