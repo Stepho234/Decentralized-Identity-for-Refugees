@@ -13,6 +13,11 @@
 (define-constant ERR-SELF-ENDORSEMENT (err u110))
 (define-constant ERR-ALREADY-ENDORSED (err u111))
 (define-constant ERR-ENDORSEMENT-COOLDOWN (err u112))
+(define-constant ERR-CREDENTIAL-NOT-FOUND (err u113))
+(define-constant ERR-INVALID-ISSUER (err u114))
+(define-constant ERR-CREDENTIAL-EXPIRED (err u115))
+(define-constant ERR-CREDENTIAL-EXISTS (err u116))
+(define-constant ERR-CREDENTIAL-REVOKED (err u117))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant IDENTITY-CREATION-FEE u1000000)
@@ -21,8 +26,10 @@
 (define-constant IDENTITY-INACTIVITY-BLOCKS u157680)
 (define-constant SUSPENSION-COOLDOWN-BLOCKS u2016)
 (define-constant ENDORSEMENT-COOLDOWN-BLOCKS u144)
+(define-constant CREDENTIAL-VALIDITY-BLOCKS u262800)
 
 (define-data-var next-identity-id uint u1)
+(define-data-var next-credential-id uint u1)
 
 (define-map identities
   { identity-id: uint }
@@ -106,6 +113,36 @@
     negative-score: uint,
     last-calculated-at: uint
   }
+)
+
+(define-map credential-issuers
+  { issuer: principal }
+  {
+    authorized-at: uint,
+    issuer-name: (string-ascii 100),
+    credential-types: (list 20 (string-ascii 50)),
+    is-active: bool
+  }
+)
+
+(define-map credentials
+  { credential-id: uint }
+  {
+    holder-id: uint,
+    issuer: principal,
+    credential-type: (string-ascii 50),
+    credential-name: (string-ascii 100),
+    issued-at: uint,
+    expires-at: uint,
+    metadata: (string-ascii 500),
+    is-revoked: bool,
+    revoked-at: uint
+  }
+)
+
+(define-map identity-credentials
+  { identity-id: uint, credential-type: (string-ascii 50) }
+  { credential-ids: (list 50 uint) }
 )
 
 (define-public (create-identity (recovery-address principal))
@@ -584,4 +621,169 @@
 
 (define-read-only (get-total-identities)
   (- (var-get next-identity-id) u1)
+)
+
+(define-public (authorize-credential-issuer (issuer principal) (issuer-name (string-ascii 100)) (credential-types (list 20 (string-ascii 50))))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    (map-set credential-issuers
+      { issuer: issuer }
+      {
+        authorized-at: stacks-block-height,
+        issuer-name: issuer-name,
+        credential-types: credential-types,
+        is-active: true
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-credential-issuer (issuer principal))
+  (let
+    (
+      (issuer-info (unwrap! (map-get? credential-issuers { issuer: issuer }) ERR-INVALID-ISSUER))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    
+    (map-set credential-issuers
+      { issuer: issuer }
+      (merge issuer-info { is-active: false })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (issue-credential (holder-id uint) (credential-type (string-ascii 50)) (credential-name (string-ascii 100)) (metadata (string-ascii 500)))
+  (let
+    (
+      (credential-id (var-get next-credential-id))
+      (issuer-info (unwrap! (map-get? credential-issuers { issuer: tx-sender }) ERR-INVALID-ISSUER))
+      (holder-identity (unwrap! (map-get? identities { identity-id: holder-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+      (expires-at (+ current-block CREDENTIAL-VALIDITY-BLOCKS))
+      (credentials-key { identity-id: holder-id, credential-type: credential-type })
+      (existing-credentials (default-to (list) (get credential-ids (map-get? identity-credentials credentials-key))))
+    )
+    (asserts! (get is-active issuer-info) ERR-INVALID-ISSUER)
+    (asserts! (is-some (index-of (get credential-types issuer-info) credential-type)) ERR-INVALID-ISSUER)
+    (asserts! (is-identity-active holder-id) ERR-IDENTITY-INACTIVE)
+    
+    (map-set credentials
+      { credential-id: credential-id }
+      {
+        holder-id: holder-id,
+        issuer: tx-sender,
+        credential-type: credential-type,
+        credential-name: credential-name,
+        issued-at: current-block,
+        expires-at: expires-at,
+        metadata: metadata,
+        is-revoked: false,
+        revoked-at: u0
+      }
+    )
+    
+    (map-set identity-credentials
+      credentials-key
+      { credential-ids: (unwrap! (as-max-len? (append existing-credentials credential-id) u50) ERR-INSUFFICIENT-BALANCE) }
+    )
+    
+    (var-set next-credential-id (+ credential-id u1))
+    (ok credential-id)
+  )
+)
+
+(define-public (revoke-credential (credential-id uint))
+  (let
+    (
+      (credential-info (unwrap! (map-get? credentials { credential-id: credential-id }) ERR-CREDENTIAL-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get issuer credential-info)) ERR-NOT-AUTHORIZED)
+    (asserts! (not (get is-revoked credential-info)) ERR-CREDENTIAL-REVOKED)
+    
+    (map-set credentials
+      { credential-id: credential-id }
+      (merge credential-info {
+        is-revoked: true,
+        revoked-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-credential (credential-id uint))
+  (map-get? credentials { credential-id: credential-id })
+)
+
+(define-read-only (get-credential-issuer (issuer principal))
+  (map-get? credential-issuers { issuer: issuer })
+)
+
+(define-read-only (get-identity-credentials (identity-id uint) (credential-type (string-ascii 50)))
+  (default-to (list) (get credential-ids (map-get? identity-credentials { identity-id: identity-id, credential-type: credential-type })))
+)
+
+(define-read-only (is-credential-valid (credential-id uint))
+  (match (map-get? credentials { credential-id: credential-id })
+    credential-info
+      (let
+        (
+          (not-revoked (not (get is-revoked credential-info)))
+          (not-expired (> (get expires-at credential-info) stacks-block-height))
+          (holder-active (is-identity-active (get holder-id credential-info)))
+          (issuer-active (match (map-get? credential-issuers { issuer: (get issuer credential-info) })
+                           issuer-data (get is-active issuer-data)
+                           false))
+        )
+        (and not-revoked not-expired holder-active issuer-active)
+      )
+    false
+  )
+)
+
+(define-read-only (verify-credential-authenticity (credential-id uint))
+  (match (map-get? credentials { credential-id: credential-id })
+    credential-info
+      (let
+        (
+          (issuer-info (map-get? credential-issuers { issuer: (get issuer credential-info) }))
+          (valid-credential (is-credential-valid credential-id))
+        )
+        {
+          is-authentic: valid-credential,
+          issuer-verified: (is-some issuer-info),
+          credential-data: (some credential-info)
+        }
+      )
+    {
+      is-authentic: false,
+      issuer-verified: false,
+      credential-data: none
+    }
+  )
+)
+
+(define-read-only (get-identity-credential-count (identity-id uint))
+  (let
+    (
+      (education-creds (len (get-identity-credentials identity-id "education")))
+      (professional-creds (len (get-identity-credentials identity-id "professional")))
+      (skill-creds (len (get-identity-credentials identity-id "skill")))
+      (certification-creds (len (get-identity-credentials identity-id "certification")))
+    )
+    {
+      education: education-creds,
+      professional: professional-creds,
+      skill: skill-creds,
+      certification: certification-creds,
+      total: (+ education-creds professional-creds skill-creds certification-creds)
+    }
+  )
 )
