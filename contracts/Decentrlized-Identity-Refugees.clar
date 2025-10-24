@@ -18,6 +18,12 @@
 (define-constant ERR-CREDENTIAL-EXPIRED (err u115))
 (define-constant ERR-CREDENTIAL-EXISTS (err u116))
 (define-constant ERR-CREDENTIAL-REVOKED (err u117))
+(define-constant ERR-EMERGENCY-CONTACT-EXISTS (err u118))
+(define-constant ERR-EMERGENCY-CONTACT-NOT-FOUND (err u119))
+(define-constant ERR-MAX-CONTACTS-REACHED (err u120))
+(define-constant ERR-EMERGENCY-NOT-ACTIVE (err u121))
+(define-constant ERR-EMERGENCY-ALREADY-ACTIVE (err u122))
+(define-constant ERR-CONTACT-ALREADY-RESPONDED (err u123))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant IDENTITY-CREATION-FEE u1000000)
@@ -30,6 +36,7 @@
 
 (define-data-var next-identity-id uint u1)
 (define-data-var next-credential-id uint u1)
+(define-data-var next-emergency-id uint u1)
 
 (define-map identities
   { identity-id: uint }
@@ -143,6 +150,46 @@
 (define-map identity-credentials
   { identity-id: uint, credential-type: (string-ascii 50) }
   { credential-ids: (list 50 uint) }
+)
+
+(define-map emergency-contacts
+  { identity-id: uint, contact: principal }
+  {
+    added-at: uint,
+    contact-type: (string-ascii 30),
+    priority-level: uint,
+    can-receive-alerts: bool,
+    last-notified: uint
+  }
+)
+
+(define-map emergency-alerts
+  { emergency-id: uint }
+  {
+    identity-id: uint,
+    activated-at: uint,
+    resolved-at: uint,
+    alert-type: (string-ascii 50),
+    message: (string-ascii 300),
+    location-data: (optional (string-ascii 200)),
+    is-active: bool,
+    responder-count: uint
+  }
+)
+
+(define-map alert-responses
+  { emergency-id: uint, responder: principal }
+  {
+    responded-at: uint,
+    response-type: (string-ascii 30),
+    assistance-offered: (string-ascii 200),
+    location-shared: bool
+  }
+)
+
+(define-map identity-emergency-contacts
+  { identity-id: uint }
+  { contacts: (list 20 principal), total-count: uint }
 )
 
 (define-public (create-identity (recovery-address principal))
@@ -784,6 +831,251 @@
       skill: skill-creds,
       certification: certification-creds,
       total: (+ education-creds professional-creds skill-creds certification-creds)
+    }
+  )
+)
+
+(define-public (add-emergency-contact (identity-id uint) (contact principal) (contact-type (string-ascii 30)) (priority-level uint))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (contacts-data (default-to { contacts: (list), total-count: u0 } 
+                       (map-get? identity-emergency-contacts { identity-id: identity-id })))
+      (current-contacts (get contacts contacts-data))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-identity-active identity-id) ERR-IDENTITY-INACTIVE)
+    (asserts! (is-none (map-get? emergency-contacts { identity-id: identity-id, contact: contact })) ERR-EMERGENCY-CONTACT-EXISTS)
+    (asserts! (< (get total-count contacts-data) u20) ERR-MAX-CONTACTS-REACHED)
+    (asserts! (<= priority-level u5) ERR-NOT-AUTHORIZED)
+    
+    (map-set emergency-contacts
+      { identity-id: identity-id, contact: contact }
+      {
+        added-at: current-block,
+        contact-type: contact-type,
+        priority-level: priority-level,
+        can-receive-alerts: true,
+        last-notified: u0
+      }
+    )
+    
+    (map-set identity-emergency-contacts
+      { identity-id: identity-id }
+      {
+        contacts: (unwrap! (as-max-len? (append current-contacts contact) u20) ERR-MAX-CONTACTS-REACHED),
+        total-count: (+ (get total-count contacts-data) u1)
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-emergency-contact (identity-id uint) (contact principal))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (contact-info (unwrap! (map-get? emergency-contacts { identity-id: identity-id, contact: contact }) ERR-EMERGENCY-CONTACT-NOT-FOUND))
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (map-delete emergency-contacts { identity-id: identity-id, contact: contact })
+    
+    (ok true)
+  )
+)
+
+(define-public (update-contact-alert-permission (identity-id uint) (contact principal) (can-receive bool))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (contact-info (unwrap! (map-get? emergency-contacts { identity-id: identity-id, contact: contact }) ERR-EMERGENCY-CONTACT-NOT-FOUND))
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (map-set emergency-contacts
+      { identity-id: identity-id, contact: contact }
+      (merge contact-info { can-receive-alerts: can-receive })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (activate-emergency-alert (identity-id uint) (alert-type (string-ascii 50)) (message (string-ascii 300)) (location-data (optional (string-ascii 200))))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (emergency-id (var-get next-emergency-id))
+      (current-block stacks-block-height)
+      (contacts-data (default-to { contacts: (list), total-count: u0 } 
+                       (map-get? identity-emergency-contacts { identity-id: identity-id })))
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-identity-active identity-id) ERR-IDENTITY-INACTIVE)
+    (asserts! (> (get total-count contacts-data) u0) ERR-EMERGENCY-CONTACT-NOT-FOUND)
+    
+    (map-set emergency-alerts
+      { emergency-id: emergency-id }
+      {
+        identity-id: identity-id,
+        activated-at: current-block,
+        resolved-at: u0,
+        alert-type: alert-type,
+        message: message,
+        location-data: location-data,
+        is-active: true,
+        responder-count: u0
+      }
+    )
+    
+    (unwrap-panic (notify-emergency-contacts identity-id emergency-id))
+    
+    (var-set next-emergency-id (+ emergency-id u1))
+    (ok emergency-id)
+  )
+)
+
+(define-private (notify-emergency-contacts (identity-id uint) (emergency-id uint))
+  (let
+    (
+      (contacts-data (default-to { contacts: (list), total-count: u0 } 
+                       (map-get? identity-emergency-contacts { identity-id: identity-id })))
+      (current-block stacks-block-height)
+    )
+    (fold update-contact-notification (get contacts contacts-data) { id: identity-id, block: current-block })
+    (ok true)
+  )
+)
+
+(define-private (update-contact-notification (contact principal) (context { id: uint, block: uint }))
+  (match (map-get? emergency-contacts { identity-id: (get id context), contact: contact })
+    contact-info
+      (if (get can-receive-alerts contact-info)
+        (begin
+          (map-set emergency-contacts
+            { identity-id: (get id context), contact: contact }
+            (merge contact-info { last-notified: (get block context) })
+          )
+          context
+        )
+        context
+      )
+    context
+  )
+)
+
+(define-public (respond-to-emergency (emergency-id uint) (response-type (string-ascii 30)) (assistance-offered (string-ascii 200)) (share-location bool))
+  (let
+    (
+      (alert-info (unwrap! (map-get? emergency-alerts { emergency-id: emergency-id }) ERR-EMERGENCY-NOT-ACTIVE))
+      (identity-id (get identity-id alert-info))
+      (contact-info (unwrap! (map-get? emergency-contacts { identity-id: identity-id, contact: tx-sender }) ERR-EMERGENCY-CONTACT-NOT-FOUND))
+      (existing-response (map-get? alert-responses { emergency-id: emergency-id, responder: tx-sender }))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-active alert-info) ERR-EMERGENCY-NOT-ACTIVE)
+    (asserts! (is-none existing-response) ERR-CONTACT-ALREADY-RESPONDED)
+    (asserts! (get can-receive-alerts contact-info) ERR-NOT-AUTHORIZED)
+    
+    (map-set alert-responses
+      { emergency-id: emergency-id, responder: tx-sender }
+      {
+        responded-at: current-block,
+        response-type: response-type,
+        assistance-offered: assistance-offered,
+        location-shared: share-location
+      }
+    )
+    
+    (map-set emergency-alerts
+      { emergency-id: emergency-id }
+      (merge alert-info { responder-count: (+ (get responder-count alert-info) u1) })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (resolve-emergency-alert (emergency-id uint))
+  (let
+    (
+      (alert-info (unwrap! (map-get? emergency-alerts { emergency-id: emergency-id }) ERR-EMERGENCY-NOT-ACTIVE))
+      (identity-info (unwrap! (map-get? identities { identity-id: (get identity-id alert-info) }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (get is-active alert-info) ERR-EMERGENCY-NOT-ACTIVE)
+    
+    (map-set emergency-alerts
+      { emergency-id: emergency-id }
+      (merge alert-info {
+        is-active: false,
+        resolved-at: current-block
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-read-only (get-emergency-contact (identity-id uint) (contact principal))
+  (map-get? emergency-contacts { identity-id: identity-id, contact: contact })
+)
+
+(define-read-only (get-identity-emergency-contacts (identity-id uint))
+  (default-to { contacts: (list), total-count: u0 }
+    (map-get? identity-emergency-contacts { identity-id: identity-id })
+  )
+)
+
+(define-read-only (get-emergency-alert (emergency-id uint))
+  (map-get? emergency-alerts { emergency-id: emergency-id })
+)
+
+(define-read-only (get-alert-response (emergency-id uint) (responder principal))
+  (map-get? alert-responses { emergency-id: emergency-id, responder: responder })
+)
+
+(define-read-only (is-emergency-active (emergency-id uint))
+  (match (map-get? emergency-alerts { emergency-id: emergency-id })
+    alert-info (get is-active alert-info)
+    false
+  )
+)
+
+(define-read-only (get-active-emergencies-for-identity (identity-id uint))
+  (let
+    (
+      (total-emergencies (var-get next-emergency-id))
+    )
+    (fold check-active-emergency (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) { target-id: identity-id, active-count: u0 })
+  )
+)
+
+(define-private (check-active-emergency (emergency-id uint) (context { target-id: uint, active-count: uint }))
+  (match (map-get? emergency-alerts { emergency-id: emergency-id })
+    alert-info
+      (if (and (is-eq (get identity-id alert-info) (get target-id context)) (get is-active alert-info))
+        (merge context { active-count: (+ (get active-count context) u1) })
+        context
+      )
+    context
+  )
+)
+
+(define-read-only (get-emergency-network-status (identity-id uint))
+  (let
+    (
+      (contacts-data (get-identity-emergency-contacts identity-id))
+      (active-emergencies (get-active-emergencies-for-identity identity-id))
+    )
+    {
+      total-contacts: (get total-count contacts-data),
+      active-emergencies: (get active-count active-emergencies),
+      has-emergency-network: (> (get total-count contacts-data) u0)
     }
   )
 )
