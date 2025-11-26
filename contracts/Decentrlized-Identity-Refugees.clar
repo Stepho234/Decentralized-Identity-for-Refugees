@@ -24,6 +24,9 @@
 (define-constant ERR-EMERGENCY-NOT-ACTIVE (err u121))
 (define-constant ERR-EMERGENCY-ALREADY-ACTIVE (err u122))
 (define-constant ERR-CONTACT-ALREADY-RESPONDED (err u123))
+(define-constant ERR-DELEGATE-ALREADY-EXISTS (err u124))
+(define-constant ERR-DELEGATE-NOT-FOUND (err u125))
+(define-constant ERR-DELEGATION-EXPIRED (err u126))
 
 (define-constant CONTRACT-OWNER tx-sender)
 (define-constant IDENTITY-CREATION-FEE u1000000)
@@ -190,6 +193,11 @@
 (define-map identity-emergency-contacts
   { identity-id: uint }
   { contacts: (list 20 principal), total-count: uint }
+)
+
+(define-map data-delegates
+  { identity-id: uint, delegate: principal, data-key: (string-ascii 50) }
+  { authorized-at: uint, expires-at: uint }
 )
 
 (define-public (create-identity (recovery-address principal))
@@ -1079,3 +1087,66 @@
     }
   )
 )
+
+;; Delegated Data Management Features
+
+(define-public (add-data-delegate (identity-id uint) (delegate principal) (data-key (string-ascii 50)) (duration-blocks uint))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    (asserts! (is-identity-active identity-id) ERR-IDENTITY-INACTIVE)
+    (asserts! (is-none (map-get? data-delegates { identity-id: identity-id, delegate: delegate, data-key: data-key })) ERR-DELEGATE-ALREADY-EXISTS)
+    
+    (map-set data-delegates
+      { identity-id: identity-id, delegate: delegate, data-key: data-key }
+      {
+        authorized-at: current-block,
+        expires-at: (+ current-block duration-blocks)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (revoke-data-delegate (identity-id uint) (delegate principal) (data-key (string-ascii 50)))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+    )
+    (asserts! (is-eq (get owner identity-info) tx-sender) ERR-NOT-AUTHORIZED)
+    
+    (map-delete data-delegates { identity-id: identity-id, delegate: delegate, data-key: data-key })
+    (ok true)
+  )
+)
+
+(define-public (update-identity-data-delegated (identity-id uint) (data-key (string-ascii 50)) (data-value (string-ascii 500)) (encrypted bool))
+  (let
+    (
+      (identity-info (unwrap! (map-get? identities { identity-id: identity-id }) ERR-IDENTITY-NOT-FOUND))
+      (delegation-info (unwrap! (map-get? data-delegates { identity-id: identity-id, delegate: tx-sender, data-key: data-key }) ERR-DELEGATE-NOT-FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-identity-active identity-id) ERR-IDENTITY-INACTIVE)
+    (asserts! (< current-block (get expires-at delegation-info)) ERR-DELEGATION-EXPIRED)
+    
+    (map-set identity-data
+      { identity-id: identity-id, data-key: data-key }
+      { data-value: data-value, encrypted: encrypted }
+    )
+    
+    (map-set identities
+      { identity-id: identity-id }
+      (merge identity-info { updated-at: current-block })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-data-delegate (identity-id uint) (delegate principal) (data-key (string-ascii 50)))
+  (map-get? data-delegates { identity-id: identity-id, delegate: delegate, data-key: data-key })
+)
+
